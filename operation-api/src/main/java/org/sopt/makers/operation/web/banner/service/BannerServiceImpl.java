@@ -1,6 +1,11 @@
 package org.sopt.makers.operation.web.banner.service;
 
+import static org.sopt.makers.operation.code.failure.BannerFailureCode.NOT_SUPPORTED_PLATFORM_TYPE;
+import static org.sopt.makers.operation.code.success.web.BannerSuccessCode.SUCCESS_DELETE_BANNER;
+
+import java.io.IOException;
 import java.time.Clock;
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import lombok.RequiredArgsConstructor;
@@ -16,12 +21,16 @@ import org.sopt.makers.operation.banner.repository.BannerRepository;
 import org.sopt.makers.operation.client.s3.S3Service;
 import org.sopt.makers.operation.code.failure.BannerFailureCode;
 import org.sopt.makers.operation.config.ValueConfig;
+import org.sopt.makers.operation.dto.BaseResponse;
 import org.sopt.makers.operation.exception.BannerException;
+import org.sopt.makers.operation.util.ApiResponseUtil;
 import org.sopt.makers.operation.web.banner.dto.request.*;
 import org.sopt.makers.operation.web.banner.dto.response.BannerResponse;
 import org.sopt.makers.operation.web.banner.dto.response.BannerResponse.*;
+import org.springframework.http.ResponseEntity;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.*;
+import org.springframework.web.multipart.MultipartFile;
 
 @Service
 @RequiredArgsConstructor
@@ -30,6 +39,7 @@ public class BannerServiceImpl implements BannerService {
     private static final String SLASH = "/";
     private static final String PROTOCOL_SEPARATOR = "//";
     private static final int PROTOCOL_END_OFFSET = 2;
+    private static final String S3_BASE_URL = "https://makers-banner.s3.ap-northeast-2.amazonaws.com/";
     private final BannerRepository bannerRepository;
     private final S3Service s3Service;
     private final ValueConfig valueConfig;
@@ -41,10 +51,12 @@ public class BannerServiceImpl implements BannerService {
         return BannerResponse.BannerDetail.fromEntity(banner);
     }
 
+    @Transactional
     @Override
-    public void deleteBanner(final long bannerId) {
+    public ResponseEntity<BaseResponse<?>> deleteBanner(final long bannerId) {
         val banner = getBannerById(bannerId);
         bannerRepository.delete(banner);
+        return ApiResponseUtil.success(SUCCESS_DELETE_BANNER);
     }
 
   @Override
@@ -53,11 +65,18 @@ public class BannerServiceImpl implements BannerService {
 
      val bannerList = bannerRepository.findBannersByLocation(publishLocation);
 
-     List<String> list = bannerList.stream()
-         .map( banner -> banner.getImage().retrieveImageUrl(imageType))
-         .toList();
 
-    return BannerResponse.BannerImageUrl.fromEntity(list);
+      List<String> urlList = bannerList.stream()
+              .map(banner -> {
+                  return switch (imageType) {
+                      case "pc" -> banner.getPcImageUrl();
+                      case "mobile" -> banner.getMobileImageUrl();
+                      default -> throw new BannerException(NOT_SUPPORTED_PLATFORM_TYPE);
+                  };
+              })
+              .toList();
+
+    return BannerResponse.BannerImageUrl.fromEntity(urlList);
   }
 
   private Banner getBannerById(final long id) {
@@ -87,37 +106,53 @@ public class BannerServiceImpl implements BannerService {
     @Transactional
     @Override
     public BannerDetail createBanner(BannerRequest.BannerCreateOrModify request) {
-        val period = getPublishPeriod(request.startDate(), request.endDate());
-        val image = getBannerImage(request.pcImage(), request.mobileImage());
+        val period = getPublishPeriod(request.start_date(), request.end_date());
+
+        String PcfileName=storeFile(request.image_pc());
+        String MobilefileName=storeFile(request.image_mobile());
+
         val newBanner = Banner.builder()
                 .publisher(request.publisher())
                 .link(request.link())
-                .contentType(ContentType.getByValue(request.bannerType()))
-                .location(PublishLocation.getByValue(request.bannerLocation()))
+                .contentType(ContentType.getByValue(request.content_type()))
+                .location(PublishLocation.getByValue(request.location()))
                 .period(period)
-                .image(image)
+                .pcImageUrl(S3_BASE_URL+PcfileName)
+                .mobileImageUrl(S3_BASE_URL+MobilefileName)
                 .build();
         val banner = saveBanner(newBanner);
 
         return BannerResponse.BannerDetail.fromEntity(banner);
     }
 
+
+    private String storeFile(MultipartFile file) {
+        try {
+            return s3Service.uploadImage("banners-images/", file,valueConfig.getBannerBucket());
+        } catch (IOException e) {
+            throw new RuntimeException("파일 업로드에 실패했습니다.", e);
+        }
+    }
+
     @Transactional
     @Override
     public BannerDetail updateBanner(Long bannerId, BannerRequest.BannerCreateOrModify request) {
-        var banner = getBannerById(bannerId);
-        val period = getPublishPeriod(request.startDate(), request.endDate());
-        val image = getBannerImage(request.pcImage(), request.mobileImage());
+        PublishPeriod period = getPublishPeriod(request.start_date(), request.end_date());
+        Banner existingBanner = getBannerById(bannerId);
 
-        deleteExistImage(banner.getImage().getPcImageUrl());
-        deleteExistImage(banner.getImage().getMobileImageUrl());
-        banner.updatePublisher(request.publisher());
-        banner.updateLink(request.link());
-        banner.updateContentType(ContentType.getByValue(request.bannerType()));
-        banner.updateLocation(PublishLocation.getByValue(request.bannerLocation()));
-        banner.updatePeriod(period);
-        banner.updateImage(image);
-        return BannerResponse.BannerDetail.fromEntity(banner);
+        String pcFileName = storeFile(request.image_pc());
+        String mobileFileName = storeFile(request.image_mobile());
+
+        // 변경 감지(dirty checking)에 의해 자동으로 업데이트됨
+        existingBanner.updateLocation(PublishLocation.getByValue(request.location()));
+        existingBanner.updateContentType(ContentType.getByValue(request.content_type()));
+        existingBanner.updatePublisher(request.publisher());
+        existingBanner.updateLink(request.link());
+        existingBanner.updatePeriod(period);
+        existingBanner.updatePcImage(S3_BASE_URL + pcFileName);
+        existingBanner.updateMobileImage(S3_BASE_URL + mobileFileName);
+
+        return BannerResponse.BannerDetail.fromEntity(existingBanner);
     }
 
     private void deleteExistImage(String url) {
